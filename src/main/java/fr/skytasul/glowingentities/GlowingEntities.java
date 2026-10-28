@@ -51,6 +51,30 @@ public class GlowingEntities implements Listener {
 
 	private int uid;
 
+	private static final boolean FOLIA = classExists("io.papermc.paper.threadedregions.RegionizedServer");
+
+	private static boolean classExists(@NotNull String name) {
+		try {
+			Class.forName(name);
+			return true;
+		} catch (ClassNotFoundException ex) {
+			return false;
+		}
+	}
+
+	/**
+	 * Runs a task off the main thread about one tick later. Folia refuses every call to the Bukkit
+	 * scheduler, and this runs from a Netty thread, where the exception would break the player's
+	 * connection, so Folia gets its own async scheduler.
+	 */
+	static void runAsyncNextTick(@NotNull Plugin plugin, @NotNull Runnable task) {
+		if (FOLIA) {
+			Bukkit.getAsyncScheduler().runDelayed(plugin, scheduledTask -> task.run(), 50, TimeUnit.MILLISECONDS);
+		} else {
+			Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, task, 1L);
+		}
+	}
+
 	/**
 	 * Initializes the Glowing API.
 	 *
@@ -851,13 +875,13 @@ public class GlowingEntities implements Listener {
 								// editing a bundle packet is annoying, so we'll let it go to the player
 								// and then send a metadata packet containing the correct glowing flag.
 
-								Bukkit.getScheduler().runTaskLaterAsynchronously(playerData.instance.plugin, () -> {
+								runAsyncNextTick(playerData.instance.plugin, () -> {
 									try {
 										updateGlowingState(glowingData);
 									} catch (ReflectiveOperationException e) {
 										e.printStackTrace();
 									}
-								}, 1L);
+								});
 								return;
 							}
 						}
