@@ -756,112 +756,118 @@ public class GlowingEntities implements Listener {
 				@Override
 				public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
 					if (msg.getClass().equals(packetMetadata.getClassInstance()) && packets.asMap().remove(msg) == null) {
-						int entityID = packetMetadataEntity.getInt(msg);
-						GlowingData glowingData = playerData.getDataFromEID(entityID);
-						if (glowingData != null) {
-
-							@SuppressWarnings("unchecked")
-							List<Object> items = (List<Object>) packetMetadataItems.get(msg);
-							if (items != null) {
-
-								boolean containsFlags = false;
-								boolean edited = false;
-								for (int i = 0; i < items.size(); i++) {
-									Object item = items.get(i);
-									Object watcherObject;
-									if (watcherItemObject != null) {
-										watcherObject = watcherItemObject.invoke(item);
-									} else {
-										Object serializer = watcherBSerializer.invoke(item);
-										watcherObject = watcherSerializerObject.invoke(serializer, watcherBId.invoke(item));
-									}
-
-									if (watcherObject.equals(watcherObjectFlags)) {
-										containsFlags = true;
-										byte flags = (byte) watcherItemDataGet.invoke(item);
-										glowingData.otherFlags = flags;
-										byte newFlags = computeFlags(glowingData);
-										if (newFlags != flags) {
-											edited = true;
-											items = new ArrayList<>(items);
-											// we cannot simply edit the item as it may be backed in the datawatcher, so we
-											// make a copy of the list
-											items.set(i, createFlagWatcherItem(newFlags));
-											break;
-											// we can break right now as the "flags" datawatcher object may not be present
-											// twice in the same packet
-										}
-									}
-								}
-
-								if (!edited && !containsFlags) {
-									// if the packet does not contain any flag information, we are unsure if it is a packet
-									// simply containing informations about another object's data update OR if it is a packet
-									// containing all non-default informations of the entity. Such as packet can be sent when
-									// the player has got far away from the entity and come in sight distance again.
-									// In this case, we must add manually the "flags" object, otherwise it would stay 0 and
-									// the entity would not be glowing.
-									// Ideally, we should listen for an "entity add" packet to be sure we are in the case
-									// above, but honestly it's annoying because there are multiple types of "entity add"
-									// packets, so we do like this instead. Less performant, but not by far.
-									byte flags = computeFlags(glowingData);
-									if (flags != 0) {
-										edited = true;
-										items = new ArrayList<>(items);
-										items.add(createFlagWatcherItem(flags));
-									}
-								}
-
-								if (edited) {
-									// some of the metadata packets are broadcasted to all players near the target entity.
-									// hence, if we directly edit the packet, some users that were not intended to see the
-									// glowing color will be able to see it. We should send a new packet to the viewer only.
-
-									Object newMsg;
-									if (version.isBefore(1, 19, 3)) {
-										newMsg = packetMetadataConstructor.newInstance(entityID, watcherDummy, false);
-										packetMetadataItems.set(newMsg, items);
-									} else {
-										newMsg = packetMetadataConstructor.newInstance(entityID, items);
-									}
-									packets.put(newMsg, dummy);
-									sendPackets(playerData.player, newMsg);
-
-									return; // we cancel the send of this packet
-								}
-							}
+						Object newMsg = createCorrectedMetadata(msg);
+						if (newMsg != null) {
+							// some of the metadata packets are broadcasted to all players near the target entity.
+							// hence, if we directly edit the packet, some users that were not intended to see the
+							// glowing color will be able to see it. We should send a new packet to the viewer only.
+							packets.put(newMsg, dummy);
+							sendPackets(playerData.player, newMsg);
+							return; // we cancel the send of this packet
 						}
 					} else if (packetBundle != null && packetBundle.getClassInstance().isInstance(msg)) {
-						handlePacketBundle(msg);
+						// editing a bundle packet is annoying, so we let it go to the player and write the corrected
+						// metadata right behind it. Writing from this handler keeps the corrected packets in order
+						// after the bundle and off any scheduler, which Folia does not provide.
+						List<Object> corrections = createBundleCorrections(msg);
+						super.write(ctx, msg, promise);
+						for (Object correction : corrections) {
+							super.write(ctx, correction, ctx.newPromise());
+						}
+						return;
 					}
 					super.write(ctx, msg, promise);
 				}
 
-				@SuppressWarnings("rawtypes")
-				private void handlePacketBundle(Object bundle) throws ReflectiveOperationException {
-					Iterable subPackets = (Iterable) packetBundlePackets.invoke(bundle);
-					for (Iterator iterator = subPackets.iterator(); iterator.hasNext();) {
-						Object packet = iterator.next();
+				/**
+				 * @return a metadata packet carrying the right flags for the viewer, or <code>null</code> if the
+				 *         given one needs no change
+				 */
+				private @Nullable Object createCorrectedMetadata(Object metadataPacket) throws ReflectiveOperationException {
+					int entityID = packetMetadataEntity.getInt(metadataPacket);
+					GlowingData glowingData = playerData.getDataFromEID(entityID);
+					if (glowingData == null)
+						return null;
 
-						if (packet.getClass().equals(packetMetadata)) {
-							int entityID = packetMetadataEntity.getInt(packet);
-							GlowingData glowingData = playerData.getDataFromEID(entityID);
-							if (glowingData != null) {
-								// means the bundle packet contains metadata about an entity that must be glowing.
-								// editing a bundle packet is annoying, so we'll let it go to the player
-								// and then send a metadata packet containing the correct glowing flag.
+					@SuppressWarnings("unchecked")
+					List<Object> items = (List<Object>) packetMetadataItems.get(metadataPacket);
+					if (items == null)
+						return null;
 
-								Bukkit.getScheduler().runTaskLaterAsynchronously(playerData.instance.plugin, () -> {
-									try {
-										updateGlowingState(glowingData);
-									} catch (ReflectiveOperationException e) {
-										e.printStackTrace();
-									}
-								}, 1L);
-								return;
+					boolean containsFlags = false;
+					boolean edited = false;
+					for (int i = 0; i < items.size(); i++) {
+						Object item = items.get(i);
+						Object watcherObject;
+						if (watcherItemObject != null) {
+							watcherObject = watcherItemObject.invoke(item);
+						} else {
+							Object serializer = watcherBSerializer.invoke(item);
+							watcherObject = watcherSerializerObject.invoke(serializer, watcherBId.invoke(item));
+						}
+
+						if (watcherObject.equals(watcherObjectFlags)) {
+							containsFlags = true;
+							byte flags = (byte) watcherItemDataGet.invoke(item);
+							glowingData.otherFlags = flags;
+							byte newFlags = computeFlags(glowingData);
+							if (newFlags != flags) {
+								edited = true;
+								items = new ArrayList<>(items);
+								// we cannot simply edit the item as it may be backed in the datawatcher, so we
+								// make a copy of the list
+								items.set(i, createFlagWatcherItem(newFlags));
+								break;
+								// we can break right now as the "flags" datawatcher object may not be present
+								// twice in the same packet
 							}
 						}
 					}
+
+					if (!edited && !containsFlags) {
+						// if the packet does not contain any flag information, we are unsure if it is a packet
+						// simply containing informations about another object's data update OR if it is a packet
+						// containing all non-default informations of the entity. Such as packet can be sent when
+						// the player has got far away from the entity and come in sight distance again.
+						// In this case, we must add manually the "flags" object, otherwise it would stay 0 and
+						// the entity would not be glowing.
+						// Ideally, we should listen for an "entity add" packet to be sure we are in the case
+						// above, but honestly it's annoying because there are multiple types of "entity add"
+						// packets, so we do like this instead. Less performant, but not by far.
+						byte flags = computeFlags(glowingData);
+						if (flags != 0) {
+							edited = true;
+							items = new ArrayList<>(items);
+							items.add(createFlagWatcherItem(flags));
+						}
+					}
+
+					if (!edited)
+						return null;
+
+					Object newMsg;
+					if (version.isBefore(1, 19, 3)) {
+						newMsg = packetMetadataConstructor.newInstance(entityID, watcherDummy, false);
+						packetMetadataItems.set(newMsg, items);
+					} else {
+						newMsg = packetMetadataConstructor.newInstance(entityID, items);
+					}
+					return newMsg;
+				}
+
+				@SuppressWarnings("rawtypes")
+				private List<Object> createBundleCorrections(Object bundle) throws ReflectiveOperationException {
+					List<Object> corrections = new ArrayList<>(1);
+					Iterable subPackets = (Iterable) packetBundlePackets.invoke(bundle);
+					for (Iterator iterator = subPackets.iterator(); iterator.hasNext();) {
+						Object packet = iterator.next();
+						if (packetMetadata.getClassInstance().isInstance(packet)) {
+							Object correction = createCorrectedMetadata(packet);
+							if (correction != null)
+								corrections.add(correction);
+						}
+					}
+					return corrections;
 				}
 
 			};
