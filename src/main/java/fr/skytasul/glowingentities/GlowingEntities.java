@@ -168,6 +168,7 @@ public class GlowingEntities implements Listener {
 			glowingData = new GlowingData(playerData, entity, teamID);
 			glowingData.color = color;
 			glowingData.otherFlags = otherFlags;
+			glowingData.realEntityId = Packets.readRealEntityId(entity);
 			playerData.glowingDatas.put(entity, glowingData);
 
 			Packets.createGlowing(glowingData);
@@ -175,6 +176,7 @@ public class GlowingEntities implements Listener {
 				Packets.setGlowingColor(glowingData);
 		} else {
 			// the player already had datas related to the entity: we must update the glowing status
+			glowingData.realEntityId = Packets.readRealEntityId(entity);
 
 			if (Objects.equals(glowingData.color, color))
 				return; // nothing changed
@@ -253,7 +255,11 @@ public class GlowingEntities implements Listener {
 
 		@Nullable GlowingData getDataFromEID(int entityId) {
 			for (GlowingData data : glowingDatas.values()) {
-				if (data.entity.getEntityId(player.getWorld()).orElse(-1) == entityId)
+				// Folia refuses Entity#getEntityId off the entity's region thread, and this runs on Netty.
+				// The cached ID goes stale only if the entity changes dimension.
+				int dataEntityId = Packets.isFolia && data.realEntityId != -1 ? data.realEntityId
+						: data.entity.getEntityId(player.getWorld()).orElse(-1);
+				if (dataEntityId == entityId)
 					return data;
 			}
 			return null;
@@ -304,6 +310,7 @@ public class GlowingEntities implements Listener {
 
 		@Nullable ChatColor color = null;
 		volatile byte otherFlags = 0;
+		volatile int realEntityId = -1;
 		boolean enabled = true;
 
 		GlowingData(@NotNull PlayerData player, @NotNull EntityIdentifier entity, @NotNull String teamID) {
@@ -330,7 +337,11 @@ public class GlowingEntities implements Listener {
 		private static boolean hasInitialized = false;
 		private static Throwable initializationError = null;
 
+		static final boolean isFolia = classExists("io.papermc.paper.threadedregions.RegionizedServer");
+
 		private static Method getHandle;
+		// Folia checks the owning region in getHandle; the raw one is enough to reach a player's connection.
+		private static Method getHandleRaw;
 		private static Method getDataWatcher;
 
 		// Synched datas
@@ -475,6 +486,11 @@ public class GlowingEntities implements Listener {
 					.newInstance(markerEntityType, worldInstance);
 
 			getHandle = cpack == null ? null : getCraftClass("entity", "CraftEntity").getDeclaredMethod("getHandle");
+			try {
+				getHandleRaw = cpack == null ? null : getCraftClass("entity", "CraftEntity").getDeclaredMethod("getHandleRaw");
+			} catch (NoSuchMethodException ex) {
+				getHandleRaw = getHandle;
+			}
 			getDataWatcher = entityClass.getMethodInstance("getEntityData");
 
 			/* Synched datas */
@@ -622,8 +638,21 @@ public class GlowingEntities implements Listener {
 			return registryClass.getMethod("getValue", identifierClass).invoke(entityTypeRegistry, identifier);
 		}
 
+		private static boolean classExists(String name) {
+			try {
+				Class.forName(name);
+				return true;
+			} catch (ClassNotFoundException ex) {
+				return false;
+			}
+		}
+
+		static int readRealEntityId(EntityIdentifier entity) {
+			return entity instanceof EntityidentifierRealEntity real ? real.entity().getEntityId() : -1;
+		}
+
 		public static void sendPackets(Player p, Object... packets) throws ReflectiveOperationException {
-			Object connection = playerConnection.get(getHandle.invoke(p));
+			Object connection = playerConnection.get(getHandleRaw.invoke(p));
 			for (Object packet : packets) {
 				if (packet == null)
 					continue;
@@ -748,7 +777,7 @@ public class GlowingEntities implements Listener {
 		}
 
 		private static Channel getChannel(Player player) throws ReflectiveOperationException {
-			return (Channel) channelField.get(networkManager.get(playerConnection.get(getHandle.invoke(player))));
+			return (Channel) channelField.get(networkManager.get(playerConnection.get(getHandleRaw.invoke(player))));
 		}
 
 		public static void addPacketsHandler(PlayerData playerData) throws ReflectiveOperationException {
